@@ -128,41 +128,60 @@ def normalize_pos(pos1: np.ndarray,
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
-def load_scenario2(noise_m=1.0, n_beams=64, norm_type=4, max_samples=2974):
+import torch
+import torch.nn as nn
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+def build_mlp(
+    input_dim=2,
+    output_dim=64,
+    hidden_dim=128,
+    hidden_layers=2,
+    activation="ReLU",
+    lr=1e-2,
+    milestones=[20, 40],
+    gamma=0.2,
+):
     """
-    Load scenario 2 DeepSense files, add GPS noise, normalize positions, and select beams.
+    Build a simple feed-forward neural network (MLP) and 
+    initialize optimizer, criterion, and learning rate scheduler.
+
+    Args:
+        input_dim (int): number of input features (default=2 for UE positions).
+        output_dim (int): number of output classes (default=64 for beams).
+        hidden_dim (int): hidden layer width.
+        hidden_layers (int): number of hidden layers.
+        activation (str): activation function ("ReLU", "Tanh", "Sigmoid", ...).
+        lr (float): learning rate for Adam optimizer.
+        milestones (list[int]): epochs at which to reduce LR.
+        gamma (float): factor to reduce LR at milestones.
+
+    Returns:
+        model (nn.Module): the neural network.
+        criterion (nn.Module): loss function.
+        optimizer (torch.optim.Optimizer): optimizer for model parameters.
+        scheduler (torch.optim.lr_scheduler): learning rate scheduler.
     """
-    # Hard-coded files
-    pos1_file = DATA_DIR / "scenario2_unit1_loc_1-2974.npy"
-    pos2_file = DATA_DIR / "scenario2_unit2_loc_1-2974.npy"
-    pwr1_file = DATA_DIR / "scenario2_unit1_pwr_60ghz_1-2974.npy"
-    seq_file  = DATA_DIR / "scenario2_seq_index_1-2974.npy"
+    # --- Build layers ---
+    layers = []
+    in_dim = input_dim
+    act_layer = getattr(nn, activation)
 
-    pos1 = np.load(pos1_file)[:, :2]
-    pos2 = np.load(pos2_file)[:, :2]
-    pwr1 = np.load(pwr1_file)
-    seq  = np.load(seq_file)
+    for _ in range(hidden_layers):
+        layers.append(nn.Linear(in_dim, hidden_dim))
+        layers.append(act_layer())
+        in_dim = hidden_dim
 
-    # Limit samples
-    N = min(max_samples, len(pos2))
-    pos1, pos2, pwr1, seq = pos1[:N], pos2[:N], pwr1[:N], seq[:N]
+    layers.append(nn.Linear(hidden_dim, output_dim))
 
-    # Add noise
-    pos2_noisy = add_pos_noise(pos2, noise_variance_in_m=noise_m)
+    model = nn.Sequential(*layers)
 
-    # Normalize positions
-    gps_positions = normalize_pos(pos1, pos2_noisy, norm_type)
+    # --- Training components ---
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=gamma)
 
-    # Beam selection
-    max_beams = pwr1.shape[-1]
-    divider = max_beams // n_beams
-    beam_idxs = np.arange(0, divider * n_beams, divider)
-    pwrs = pwr1[:, beam_idxs]
-
-    best_beam = np.argmax(pwrs, axis=1)
-
-    print(f"[Scenario2] N={N} | beams={n_beams}/{max_beams} | norm={norm_type} | noise={noise_m}m")
-    print("gps_positions:", gps_positions.shape, "powers:", pwrs.shape, "labels:", best_beam.shape)
-
-    return best_beam, pwrs, gps_positions, seq
-
+    return model, criterion, optimizer, scheduler
