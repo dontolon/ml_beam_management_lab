@@ -1,0 +1,10 @@
+numpy>=1.22
+pandas>=1.5
+matplotlib>=3.6
+torch>=2.0
+scikit-learn>=1.2
+utm>=0.7
+
+# optional extras
+seaborn>=0.12
+tqdm>=4.65
