@@ -4,6 +4,9 @@ import numpy as np
 import utm
 from pathlib import Path
 from typing import Tuple
+import torch.nn as nn
+import torch
+from torch.utils.data import TensorDataset, DataLoader
 
 def load_config(config_path: str | Path):
     """Load JSON configuration."""
@@ -185,3 +188,299 @@ def build_mlp(
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=gamma)
 
     return model, criterion, optimizer, scheduler
+
+
+def evaluate(loader, model, k_values):
+    """
+    Evaluate top-k accuracies.
+    Returns dict {k: acc}.
+    """
+    model.eval()
+    correct_topk = {k: 0 for k in k_values}
+    total = 0
+
+    with torch.no_grad():
+        for xb, yb in loader:
+            out = model(xb)                       # logits
+            _, pred_topk = out.topk(max(k_values), dim=1)  # top-k predictions
+            total += yb.size(0)
+            for k in k_values:
+                correct_topk[k] += (pred_topk[:, :k] == yb.unsqueeze(1)).any(dim=1).sum().item()
+
+    return {k: correct_topk[k]/total for k in k_values}
+
+# Training loop
+def run_epoch(loader, model, optimizer, criterion, train=True):
+    losses, correct, total = [], 0, 0
+    if train: model.train()
+    else: model.eval()
+
+    for xb, yb in loader:
+        if train: optimizer.zero_grad()
+        out = model(xb)
+        loss = criterion(out, yb)
+        if train:
+            loss.backward()
+            optimizer.step()
+        losses.append(loss.item())
+        pred = out.argmax(dim=1)
+        correct += (pred == yb).sum().item()
+        total += len(yb)
+    return np.mean(losses), correct/total
+
+#######################FEDERATED################################
+
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+
+# --- small utility: normalize together for visualization so BS + UEs share same [0,1] scale
+def _normalize_for_plot(BS_location, UE_locations):
+    both = np.vstack([BS_location, UE_locations])  # (1+N, 2)
+    mn = both.min(axis=0, keepdims=True)
+    mx = both.max(axis=0, keepdims=True)
+    eps = 1e-9
+    both_n = (both - mn) / np.maximum(mx - mn, eps)
+    return both_n[0:1], both_n[1:]  # BS_norm, UE_norm
+
+# ========== SPLITTING FUNCTIONS ==========
+
+def split_iid_equal_indices(N, num_clients=8, seed=42):
+    """
+    IID split: shuffle indices and split into equal (or near-equal) shards.
+    Returns: list of np.ndarray indices, one per client.
+    """
+    rng = np.random.default_rng(seed)
+    idx = np.arange(N)
+    rng.shuffle(idx)
+    shards = np.array_split(idx, num_clients)
+    return [np.asarray(s, dtype=int) for s in shards]
+
+def split_noniid_label_dirichlet(
+    y, num_clients=10, alpha_labels=0.5, alpha_sizes=1.0, min_per_client=10, seed=42
+):
+    """
+    Non-IID split using Dirichlet BOTH for:
+    - label distributions (alpha_labels)
+    - client sizes (alpha_sizes)
+
+    Args:
+      y: label vector (N,)
+      num_clients: number of clients
+      alpha_labels: Dirichlet concentration for label proportions (class skew)
+      alpha_sizes: Dirichlet concentration for client sizes (size skew)
+      min_per_client: ensure each client has at least this many samples
+      seed: RNG seed
+
+    Returns:
+      list of np.ndarray indices (one per client)
+    """
+    rng = np.random.default_rng(seed)
+    N = len(y)
+    classes = np.unique(y)
+
+    # Step 1: decide total size per client (size skew)
+    size_props = rng.dirichlet([alpha_sizes] * num_clients)
+    size_counts = np.floor(size_props * N).astype(int)
+
+    # ensure everyone has min_per_client
+    for i in range(num_clients):
+        if size_counts[i] < min_per_client:
+            size_counts[i] = min_per_client
+    while size_counts.sum() > N:
+        j = rng.integers(0, num_clients)
+        if size_counts[j] > min_per_client:
+            size_counts[j] -= 1
+    while size_counts.sum() < N:
+        j = rng.integers(0, num_clients)
+        size_counts[j] += 1
+
+    # Step 2: allocate per-class samples using Dirichlet
+    idx_by_class = {c: np.where(y == c)[0] for c in classes}
+    for c in classes:
+        rng.shuffle(idx_by_class[c])
+
+    client_indices = [[] for _ in range(num_clients)]
+    for c in classes:
+        idxs = idx_by_class[c]
+        n_c = len(idxs)
+
+        # how much of this class goes to each client
+        class_props = rng.dirichlet([alpha_labels] * num_clients)
+        class_counts = (class_props * n_c).astype(int)
+
+        # adjust to exact n_c
+        while class_counts.sum() < n_c:
+            class_counts[rng.integers(0, num_clients)] += 1
+        while class_counts.sum() > n_c:
+            j = rng.integers(0, num_clients)
+            if class_counts[j] > 0:
+                class_counts[j] -= 1
+
+        # assign slices to each client
+        start = 0
+        for j in range(num_clients):
+            take = class_counts[j]
+            if take > 0:
+                client_indices[j].extend(idxs[start:start+take])
+                start += take
+
+    # Step 3: enforce overall client sizes (truncate/extend if needed)
+    final_clients = []
+    for j in range(num_clients):
+        idxs = rng.permutation(client_indices[j])
+        if len(idxs) > size_counts[j]:
+            idxs = idxs[:size_counts[j]]
+        elif len(idxs) < size_counts[j]:
+            # randomly duplicate to meet quota
+            extra = rng.choice(idxs, size_counts[j] - len(idxs), replace=True)
+            idxs = np.concatenate([idxs, extra])
+        final_clients.append(np.array(idxs, dtype=int))
+
+    return final_clients
+
+
+# ========== PLOTTING ==========
+
+def plot_client_split(UE_locations, client_splits, BS_location=None, normalize=True, title=None):
+    """
+    Visualize client partitions over the UE positions.
+    - UE_locations: (N, 2) in lat/lon (or any 2D) for plotting
+    - client_splits: list of np.ndarray indices (one per client)
+    - BS_location: (1,2) optional; if provided and normalize=True it’s normalized with UEs
+    - normalize: if True, min-max normalize BS+UEs together for a clean [0,1] plot
+    """
+    if normalize and BS_location is not None:
+        BS_norm, UE_norm = _normalize_for_plot(BS_location, UE_locations)
+        Xplot, Bplot = UE_norm, BS_norm[0]
+    else:
+        Xplot = UE_locations
+        Bplot = BS_location[0] if BS_location is not None else None
+
+    plt.figure(figsize=(10,6))
+    cmap = plt.cm.get_cmap('tab20', len(client_splits))
+
+    # plot each client with a distinct color
+    for i, idxs in enumerate(client_splits):
+        plt.scatter(Xplot[idxs,0], Xplot[idxs,1], s=8, color=cmap(i), label=f"Client {i} ({len(idxs)})", alpha=0.8)
+
+    # BS marker
+    if BS_location is not None:
+        plt.scatter(Bplot[0], Bplot[1], c="red", marker="*", s=100, label="BS")
+
+    plt.xlabel("X")
+    plt.ylabel("Y")
+    plt.title(title if title else "Client split visualization")
+    if len(client_splits) <= 12:
+        plt.legend(markerscale=2, fontsize=9, frameon=True)
+    plt.tight_layout()
+    plt.show()
+
+# ========== BUILD CLIENT LOADERS FOR FL LOOP ==========
+
+def make_client_loaders(X, y, client_splits, batch_size=32, shuffle=True):
+    """
+    Turn a client split (list of index arrays) into DataLoaders.
+    Returns: list of (loader, num_samples).
+    """
+    clients = []
+    for idxs in client_splits:
+        Xt = torch.tensor(X[idxs], dtype=torch.float32)
+        yt = torch.tensor(y[idxs], dtype=torch.long)
+        loader = DataLoader(TensorDataset(Xt, yt), batch_size=batch_size, shuffle=shuffle)
+        clients.append((loader, len(idxs)))
+    return clients
+
+# ===== FedAvg helpers that work with `build_mlp` =====
+import numpy as np
+import torch
+import torch.nn as nn
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def get_state_dict(model):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+def set_state_dict(model, state):
+    model.load_state_dict(state, strict=True)
+
+def local_train_on_client(
+    model_ctor,          # must return (model, criterion, optimizer, scheduler)
+    global_state,        # server's current weights
+    client_loader,       # DataLoader for this client
+    local_epochs=1,
+    device=DEVICE,
+):
+    """
+    Train a local model starting from `global_state` on one client's data.
+    Uses the (criterion, optimizer, scheduler) returned by your model_ctor (build_mlp wrapper).
+    """
+    model, criterion, optimizer, scheduler = model_ctor()
+    model = model.to(device)
+    set_state_dict(model, global_state)   # start from server weights
+
+    model.train()
+    for _ in range(local_epochs):
+        for xb, yb in client_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+    return get_state_dict(model)
+
+def fedavg(states, sizes):
+    total = float(np.sum(sizes))
+    avg = {k: torch.zeros_like(v) for k, v in states[0].items()}
+    for st, n in zip(states, sizes):
+        w = n / total
+        for k in avg:
+            avg[k] += st[k] * w
+    return avg
+
+def sample_clients_indices(num_clients, fraction, seed=None):
+    rng = np.random.default_rng(seed)
+    m = max(1, int(round(fraction * num_clients)))
+    return rng.choice(num_clients, size=m, replace=False).tolist()
+
+def federated_round(
+    model,               # global model (updated in-place)
+    model_ctor,          # returns (model, criterion, optimizer, scheduler)
+    clients,             # list of (loader, num_samples)
+    client_fraction=1,
+    local_epochs=1,
+    seed=None,
+):
+    """
+    One FedAvg round:
+      - sample clients
+      - each client trains locally from current global state
+      - server aggregates via weighted average
+    """
+    C = len(clients)
+    selected = sample_clients_indices(C, client_fraction, seed=seed)
+
+    global_state = get_state_dict(model)
+    local_states, sizes = [], []
+
+    for cid in selected:
+        loader, n = clients[cid]
+        new_state = local_train_on_client(
+            model_ctor=model_ctor,
+            global_state=global_state,
+            client_loader=loader,
+            local_epochs=local_epochs,
+            device=DEVICE,
+        )
+        local_states.append(new_state)
+        sizes.append(n)
+
+    new_global = fedavg(local_states, sizes)
+    set_state_dict(model, new_global)
+    return selected
