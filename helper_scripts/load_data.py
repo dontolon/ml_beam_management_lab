@@ -8,21 +8,6 @@ import torch.nn as nn
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 
-def load_config(config_path: str | Path):
-    """Load JSON configuration."""
-    config_path = Path(config_path)
-    print("---------------------------------------------------------")
-    print(f"Loading config from: {config_path}")
-    try:
-        with config_path.open('r') as f:
-            cfg = json.load(f)
-        print("Config loaded.")
-        return cfg
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Config not found: {config_path}")
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON at {config_path}: {e}")
-
 def min_max(arr: np.ndarray, axis=0, eps=1e-9) -> np.ndarray:
     """Min-max normalize along axis with numerical safety."""
     arr = np.asarray(arr)
