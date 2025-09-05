@@ -176,31 +176,27 @@ def build_mlp(
 
 
 def evaluate(loader, model, k_values):
-    """
-    Evaluate top-k accuracies.
-    Returns dict {k: acc}.
-    """
     model.eval()
+    device = next(model.parameters()).device
     correct_topk = {k: 0 for k in k_values}
     total = 0
-
     with torch.no_grad():
         for xb, yb in loader:
-            out = model(xb)                       # logits
-            _, pred_topk = out.topk(max(k_values), dim=1)  # top-k predictions
+            xb = xb.to(device)
+            yb = yb.to(device)
+            out = model(xb)
+            _, pred_topk = out.topk(max(k_values), dim=1)
             total += yb.size(0)
             for k in k_values:
                 correct_topk[k] += (pred_topk[:, :k] == yb.unsqueeze(1)).any(dim=1).sum().item()
-
     return {k: correct_topk[k]/total for k in k_values}
 
-# Training loop
 def run_epoch(loader, model, optimizer, criterion, train=True):
     losses, correct, total = [], 0, 0
-    if train: model.train()
-    else: model.eval()
-
+    device = next(model.parameters()).device
+    model.train() if train else model.eval()
     for xb, yb in loader:
+        xb = xb.to(device); yb = yb.to(device)
         if train: optimizer.zero_grad()
         out = model(xb)
         loss = criterion(out, yb)
